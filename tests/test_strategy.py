@@ -39,7 +39,7 @@ def test_ret_bps_integer():
     assert ret_bps(10000, 10000) == 0
 
 
-def test_no_trade_before_warmup():
+def test_no_trade_before_sma_ready():
     bot = Bot()
     for c in [BASE] * 50:
         assert bot.decide(c, 1_000_000_000, 0) is None
@@ -81,8 +81,8 @@ def test_trailing_stop_90_below_peak():
     bot, entry = enter_bot()
     qty = 15_000_000
     assert bot.decide(entry * 10050 // 10000, 0, qty) is None  # peak +50
-    assert bot.decide(entry * 9990 // 10000, 0, qty) is None   # -60 from peak
-    sell = bot.decide(entry * 9960 // 10000, 0, qty)           # -90 from peak
+    assert bot.decide(entry * 9990 // 10000, 0, qty) is None   # ~-60 from peak
+    sell = bot.decide(entry * 9955 // 10000, 0, qty)           # ~-95 from peak
     assert sell is not None and sell["side"] == "sell"
 
 
@@ -115,10 +115,95 @@ def test_cooldown_blocks_reentry_60_bars():
 
 
 def test_deterministic_same_orders():
-    seq = [BASE] * 120 + [BASE * 9900 // 10000] * 5 + [BASE] * 10
+    # A sequence that really buys and then sells: compare the full order
+    # lists (not just "do nothing") across two fresh bots.
+    base = BASE
+    seq = [base] * 120
+    seq += [base * 9990 // 10000, base * 9980 // 10000, base * 9970 // 10000,
+            base * 9960 // 10000, base * 9950 // 10000]
+    seq += [base * 9900 // 10000] * 11
     outs = []
     for _ in range(2):
         bot = Bot()
-        got = [bot.decide(c, 1_000_000_000, 0) for c in seq]
+        got = []
+        for c in seq:
+            got.append(bot.decide(c, 1_000_000_000, 0))
+        entry = seq[-1]
+        got.append(bot.decide(entry * 10080 // 10000, 0, 15_000_000))
         outs.append(got)
     assert outs[0] == outs[1]
+    assert any(o is not None and o["side"] == "buy" for o in outs[0])
+    assert any(o is not None and o["side"] == "sell" for o in outs[0])
+
+
+# ---- protocol layer: on_batch through the real shim -----------------------
+
+def _hello(warmup_bars=0):
+    import main as _m
+    import makefun_bars as _sdk  # noqa: F401  (imported after main sets sys.path)
+    return {
+        "type": "hello", "protocol": "agent-fun/bars-replay/v1", "seed": "7",
+        "symbols": [{"symbol": "CBBTC",
+                     "mint": "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij",
+                     "price_scale": 5, "qty_scale": 8}],
+        "capital": {"quote": "USDC", "quote_scale": 6, "quote_units": "1000000000"},
+        "bar_interval": "1m", "first_close_ms": 1_767_229_200_000,
+        "caps": {"max_open_positions": 1, "max_orders_per_bar": 16,
+                 "max_weight_bps": 10000, "shorts": False, "leverage": False},
+        "fees": {"fee_bps": 4, "slippage_bps": 2,
+                 "min_notional_quote_units": "1000000"},
+        "latency_bars": 1, "warmup_bars": warmup_bars,
+    }
+
+
+def _batch(seq, close, cash=1_000_000_000, qty=0, symbol="CBBTC"):
+    import makefun_bars as sdk  # noqa: F401
+    bar = {"symbol": symbol, "t": 1_767_229_200_000 + seq * 60_000,
+           "o": str(close), "h": str(close), "l": str(close), "c": str(close),
+           "v": None, "o_depth": ["1000000000000"], "c_depth": ["1000000000000"]}
+    acct = {"cash_quote_units": str(cash),
+            "positions": ([{"symbol": "CBBTC", "qty": str(qty),
+                            "cost_quote_units": "1000000000"}] if qty else []),
+            "equity_quote_units": str(cash)}
+    return {"type": "batch", "seq": seq, "t": 1_767_229_200_000 + seq * 60_000,
+            "bars": [bar], "fills": [], "account": acct}
+
+
+def test_on_batch_warmup_records_history_but_orders_nothing():
+    import main as m
+    import makefun_bars as sdk
+    m.BOT = Bot()
+    state = sdk.BarsState(_hello(warmup_bars=120))
+    for seq in range(120):
+        state.apply_batch(_batch(seq, BASE))
+        assert m.on_batch(state, _batch(seq, BASE)) == []
+    assert len(m.BOT.closes) == 120
+    # the same dip shape that buys with no warm-up must buy now too
+    # (stop at the first buy: the test harness reports qty 0, so a bot
+    # that stayed flat would keep re-buying every bar)
+    orders = []
+    for k, c in enumerate([BASE * 9990 // 10000, BASE * 9980 // 10000,
+                           BASE * 9970 // 10000, BASE * 9960 // 10000,
+                           BASE * 9950 // 10000] + [BASE * 9900 // 10000] * 11):
+        seq = 120 + k
+        state.apply_batch(_batch(seq, c))
+        orders.extend(m.on_batch(state, _batch(seq, c)))
+        if orders:
+            break
+    assert len(orders) == 1 and orders[0]["side"] == "buy"
+    state.to_orders(orders)  # wire-shape validation by the shim
+
+
+def test_on_batch_no_cbbtc_bar_returns_nothing():
+    import main as m
+    import makefun_bars as sdk
+    m.BOT = Bot()
+    state = sdk.BarsState(_hello())
+    empty = {"type": "batch", "seq": 0, "t": 1_767_229_200_000, "bars": [],
+             "fills": [], "account": {"cash_quote_units": "1000000000",
+                                      "positions": [], "equity_quote_units": "1000000000"}}
+    state.apply_batch(empty)
+    assert m.on_batch(state, empty) == []
+    other = _batch(1, BASE, symbol="OTHER")
+    state.apply_batch(other)
+    assert m.on_batch(state, other) == []

@@ -26,7 +26,7 @@ window but turns the prior window negative, so it was rejected.
 | Window | Net PnL | Trades | Max DD | Fees |
 |---|---|---|---|---|
 | Dev (2026-11-18) | **+$10.46** | 4 | 0.76% | $1.61 |
-| Prior day (pseudo-OOS) | **+$6.18** | 5 | 1.00% | $2.41 |
+| Prior day (pseudo-OOS) | **+$1.58** | 3 | 1.00% | $1.61 |
 
 Buy-and-hold on the dev window: ≈ −$28. Dev gate: net PnL > 0 — passed.
 

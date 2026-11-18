@@ -5,8 +5,10 @@ bounce. Long only, at most one open position, full size.
 
 Entry (flat only), on a bar's close:
   the close sits at least 70 bps below its 120-bar simple moving average
+  (trailing-inclusive: the 120 closes ending with the decision bar)
   AND the 5-bar return is no worse than -20 bps (the slide is flattening,
-  not still falling). A 60-bar cooldown follows every exit.
+  not still falling). No entry on the 59 bars after an exit; re-entry is
+  allowed again from the 60th bar after the exit (60-bar cooldown).
 
 Exit (holding only): sell everything when the close reaches +80 bps above
 the entry close (take profit), or falls 90 bps below the highest close
@@ -20,7 +22,7 @@ edge found in backtests was buying a deep dip below the 2-hour average
 once the 5-minute slide had eased, and exiting on the first bounce.
 Exact-integer simulation on the dev window: net PnL +$10.46, 4 trades,
 max drawdown 0.76%. The same rules on the previous day's window
-(pseudo out-of-sample): +$6.18, 5 trades, max drawdown 1.00%.
+(pseudo out-of-sample): +$1.58, 3 trades, max drawdown 1.00%.
 Buy-and-hold on the dev window: about -$28.
 
 Determinism: pure integer arithmetic on the bar closes (bps ratios computed
@@ -64,8 +66,23 @@ def log(msg):
 
 
 def ret_bps(now, then):
-    """Return in bps from `then` to `now`, truncated toward -inf (ints only)."""
+    """Return in bps from `then` to `now`, truncated toward -inf (ints only).
+
+    Kept for diagnostics and tests. Threshold decisions below do NOT use
+    it: floor division would trigger a negative threshold up to ~1 bp
+    early, so they compare cross-multiplied instead (exact integers).
+    """
     return (now - then) * 10000 // then
+
+
+def _at_least_bps(now, then, bps):
+    """True when the return from `then` to `now` is >= `bps` (exact ints)."""
+    return (now - then) * 10000 >= bps * then
+
+
+def _at_most_bps(now, then, bps):
+    """True when the return from `then` to `now` is <= `bps` (exact ints)."""
+    return (now - then) * 10000 <= bps * then
 
 
 class Bot:
@@ -78,10 +95,14 @@ class Bot:
         self.peak = None       # Highest close since entry, while holding.
         self.cool_until = -1   # No new entry while index < cool_until.
 
-    def decide(self, close, cash, qty):
-        """One order dict, or None. `cash` in quote units, `qty` held."""
+    def observe(self, close):
+        """Record a close with no decision (warm-up bars: history, no orders)."""
         self.index += 1
         self.closes.append(close)
+
+    def decide(self, close, cash, qty):
+        """One order dict, or None. `cash` in quote units, `qty` held."""
+        self.observe(close)
         n = len(self.closes)
 
         if qty > 0:
@@ -90,9 +111,9 @@ class Bot:
                 self.peak = close
             elif close > self.peak:
                 self.peak = close
-            gain = ret_bps(close, self.entry)
-            if gain >= TAKE_PROFIT_BPS or gain <= -HARD_STOP_BPS \
-                    or ret_bps(close, self.peak) <= -TRAILING_STOP_BPS:
+            if _at_least_bps(close, self.entry, TAKE_PROFIT_BPS) \
+                    or _at_most_bps(close, self.entry, -HARD_STOP_BPS) \
+                    or _at_most_bps(close, self.peak, -TRAILING_STOP_BPS):
                 self.cool_until = self.index + COOLDOWN_BARS
                 self.entry = None
                 self.peak = None
@@ -105,10 +126,13 @@ class Bot:
         self.peak = None
         if self.index < self.cool_until or n <= SMA_LOOKBACK:
             return None
+        # The SMA is trailing-inclusive: it covers the 120 closes ending
+        # with the decision bar.
         sma = sum(self.closes[-SMA_LOOKBACK:]) // SMA_LOOKBACK
-        if ret_bps(close, sma) > -DIP_MIN_BPS:
+        if not _at_most_bps(close, sma, -DIP_MIN_BPS):
             return None
-        if ret_bps(close, self.closes[-1 - CONFIRM_LOOKBACK]) < CONFIRM_MIN_BPS:
+        if not _at_least_bps(close, self.closes[-1 - CONFIRM_LOOKBACK],
+                             CONFIRM_MIN_BPS):
             return None
         if cash < MIN_NOTIONAL_QUOTE_UNITS:
             return None
@@ -125,8 +149,6 @@ BOT = Bot()
 
 
 def on_batch(state, batch):
-    if state.warming_up:
-        return []
     bar = None
     for b in batch["bars"]:
         if b["symbol"] == SYMBOL:
@@ -135,6 +157,11 @@ def on_batch(state, batch):
     if bar is None:
         return []  # No new bar for CBBTC this minute: decide nothing.
     close = int(bar["c"])
+    if state.warming_up:
+        # Warm-up bars build history but take no orders: record the close
+        # so the SMA is warm when the scored window starts.
+        BOT.observe(close)
+        return []
     held = state.positions.get(SYMBOL)
     order = BOT.decide(close, state.cash, held.qty if held is not None else 0)
     return [order] if order is not None else []
